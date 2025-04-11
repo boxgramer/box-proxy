@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use http_body_util::Full;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::{Bytes, Incoming},
     server::conn::http1,
@@ -9,10 +9,41 @@ use hyper::{
 };
 
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
-async fn proxy_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    Ok(Response::new(Full::new(Bytes::from("Hello from proxy"))))
+type ClientBuilder = hyper::client::conn::http1::Builder;
+
+async fn proxy_handler(
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let host = req.uri().host().expect("uri has no host");
+    let port = req.uri().port_u16().unwrap_or(80);
+
+    let stream = TcpStream::connect((host, port)).await.unwrap();
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = ClientBuilder::new()
+        .preserve_header_case(true)
+        .title_case_headers(true)
+        .handshake::<_, hyper::body::Incoming>(io)
+        .await?;
+
+    tokio::task::spawn(async move {
+        if let Err(e) = conn.await {
+            println!("connection failed : {:?}", e);
+        }
+    });
+
+    let mut resp = sender.send_request(req).await?;
+    let body_bytes = resp.body_mut().collect().await?.to_bytes();
+
+    if let Ok(text) = std::str::from_utf8(&body_bytes) {
+        println!("html response : \n {}", text);
+    } else {
+        println!("Response body is not valid utf 8 ");
+    }
+
+    Ok(resp.map(|b| b.boxed()))
 }
 
 #[tokio::main]
@@ -33,4 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
+}
+
+fn empty() -> BoxBody<Bytes, hyper::Error> {
+    Empty::<Bytes>::new().map_err(|n| match n {}).boxed()
 }
